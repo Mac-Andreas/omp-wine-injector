@@ -90,6 +90,46 @@ static BOOL inject_once(HANDLE proc, const char *dll_path) {
     return TRUE;
 }
 
+/* GTA SA 1.0 US runs IsAlreadyRunning() (0x7468E0) first thing in WinMain.
+ * When the "Grand theft auto San Andreas" event already exists in the bottle
+ * (a previous instance still exiting, or killed but not yet reaped by
+ * wineserver) and FindWindowA can't find that instance's window (SA-MP
+ * renames it), the fallback at 0x746924 calls
+ * SetForegroundWindow(RsGlobal.ps->window) while RsGlobal.ps is still NULL,
+ * crashing at 0x746929. SA-MP ships the same guard
+ * (SetForegroundWindowCrashFixHook: return 0 when ps is NULL) but installs it
+ * too late to cover WinMain, so apply it here while the game is suspended:
+ * the fallback returns 0 and the game simply starts. Only patched when the
+ * original bytes match, so other executables are left alone. */
+static void patch_already_running_crash(HANDLE proc) {
+    static const BYTE expected[] = { 0xA1, 0x54, 0x70, 0xC1, 0x00, 0x8B, 0x08 };
+    static const BYTE patch[] = { 0x33, 0xC0, 0xC3 }; /* xor eax, eax ; ret */
+    LPVOID addr = (LPVOID)0x746924;
+    BYTE current[sizeof(expected)];
+    SIZE_T n = 0;
+    DWORD old = 0;
+
+    if (!ReadProcessMemory(proc, addr, current, sizeof(current), &n) || n != sizeof(current)) {
+        logf("[patch] read at 0x746924 failed: %lu", GetLastError());
+        return;
+    }
+    if (memcmp(current, expected, sizeof(expected)) != 0) {
+        logf("[patch] unexpected bytes at 0x746924 (not GTA SA 1.0 US?), skipped");
+        return;
+    }
+    if (!VirtualProtectEx(proc, addr, sizeof(patch), PAGE_EXECUTE_READWRITE, &old)) {
+        logf("[patch] VirtualProtectEx failed: %lu", GetLastError());
+        return;
+    }
+    if (!WriteProcessMemory(proc, addr, patch, sizeof(patch), &n) || n != sizeof(patch)) {
+        logf("[patch] WriteProcessMemory failed: %lu", GetLastError());
+    } else {
+        logf("[patch] IsAlreadyRunning fallback guarded");
+    }
+    VirtualProtectEx(proc, addr, sizeof(patch), old, &old);
+    FlushInstructionCache(proc, addr, sizeof(patch));
+}
+
 /* Port of inject_dll(child, dll, times, waiting_for_vorbis):
  *  - first try a direct inject;
  *  - on failure, switch to the vorbis-readiness path: wait until the game's
@@ -136,12 +176,15 @@ int main(int argc, char **argv) {
         char *slash = strrchr(workdir, '\\'); if (slash) *slash = 0;
 
         STARTUPINFOA si; ZeroMemory(&si, sizeof(si)); si.cb = sizeof(si);
-        if (!CreateProcessA(NULL, cmdline, NULL, NULL, FALSE, 0, NULL, workdir, &si, &pi)) {
+        /* Suspended so the startup crash fix lands before WinMain runs. */
+        if (!CreateProcessA(NULL, cmdline, NULL, NULL, FALSE, CREATE_SUSPENDED, NULL, workdir, &si, &pi)) {
             logf("[injector] CreateProcess failed: %lu", GetLastError());
             return 2;
         }
         pid = pi.dwProcessId;
         logf("[injector] spawned pid=%lu: %s", pid, cmdline);
+        patch_already_running_crash(pi.hProcess);
+        ResumeThread(pi.hThread);
         /* find the "--" separator */
         for (int i = 4; i < argc; i++) if (strcmp(argv[i], "--") == 0) { dll_start = i + 1; break; }
     } else if (argc >= 4 && strcmp(argv[1], "--pid") == 0) {
@@ -155,7 +198,7 @@ int main(int argc, char **argv) {
 
     if (dll_start < 0 || dll_start >= argc) {
         logf("[injector] no DLLs given after '--'");
-        if (pi.hProcess) { ResumeThread(pi.hThread); CloseHandle(pi.hThread); CloseHandle(pi.hProcess); }
+        if (pi.hProcess) { CloseHandle(pi.hThread); CloseHandle(pi.hProcess); }
         return 1;
     }
 

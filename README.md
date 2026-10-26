@@ -25,7 +25,13 @@ within Wine instead of from a native Windows host.
 
 ## Behaviour (mirrors the launcher's `inject_dll`)
 
-1. Spawn (or attach to) the game process.
+1. Spawn (or attach to) the game process. A spawned game starts suspended so
+   one startup crash can be guarded before `WinMain` runs: GTA SA 1.0 US's
+   `IsAlreadyRunning()` dereferences a NULL `RsGlobal.ps` (crash at `0x746929`)
+   when a previous instance's named event still exists in the bottle but its
+   window can't be found. The injector patches that fallback to return 0 — the
+   same guard SA-MP applies, but SA-MP's hook lands too late for `WinMain` —
+   only when the original bytes match, then resumes the game.
 2. Inject each DLL with `VirtualAllocEx` + `WriteProcessMemory` +
    `CreateRemoteThread(LoadLibraryA)`.
 3. On the first failure, switch to the **vorbis-readiness** path: wait until the
